@@ -11,6 +11,7 @@ import uuid
 import faiss
 from typing import List, TypedDict, Annotated, Sequence, Literal
 from dotenv import load_dotenv
+from requests.exceptions import JSONDecodeError # Import the specific error
 
 # Load environment variables from .env file (optional, mainly for local testing)
 load_dotenv()
@@ -35,33 +36,69 @@ from langgraph.prebuilt import ToolNode
 # Ensure HUGGINGFACEHUB_API_TOKEN is set in your environment or Streamlit secrets.
 HUGGINGFACEHUB_API_TOKEN = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
 
+# --- Critical Check for API Token --- 
 if not HUGGINGFACEHUB_API_TOKEN:
-    print("Warning: HUGGINGFACEHUB_API_TOKEN not found. Agent may not function correctly.")
-    # In a deployed app, you might raise an error or handle this differently
+    # In a deployed app, raising an error is often better than just warning.
+    raise ValueError(
+        "HUGGINGFACEHUB_API_TOKEN environment variable not found. "
+        "This is required to use the Hugging Face Inference API for embeddings and the LLM. "
+        "Please ensure it is set in your environment (e.g., Streamlit secrets)."
+    )
 
 # --- Memory Setup --- 
 
 # Using Hugging Face Inference API Embeddings
 # Requires a HUGGINGFACEHUB_API_TOKEN
 # Using a common sentence-transformer model available on HF Inference API
-embeddings = HuggingFaceInferenceAPIEmbeddings(
-    api_key=HUGGINGFACEHUB_API_TOKEN,
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+try:
+    embeddings = HuggingFaceInferenceAPIEmbeddings(
+        api_key=HUGGINGFACEHUB_API_TOKEN,
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+except Exception as e:
+    # Catch potential errors during embedding model initialization itself
+    raise RuntimeError(f"Failed to initialize HuggingFaceInferenceAPIEmbeddings: {e}") from e
 
 # FAISS vector store (in-memory)
 # Note: For persistence across runs, you'd save/load the index.
 # Using default FAISS setup for simplicity
 # Check if the vector store file exists, load it, otherwise create a new one
 FAISS_INDEX_PATH = "faiss_story_index"
-if os.path.exists(FAISS_INDEX_PATH):
-    print(f"Loading existing FAISS index from {FAISS_INDEX_PATH}")
-    vector_store = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-else:
-    print("Creating new FAISS index.")
-    # Initialize with a dummy entry if creating new
-    vector_store = FAISS.from_texts(["Initial dummy entry"], embeddings)
-    vector_store.save_local(FAISS_INDEX_PATH)
+vector_store = None # Initialize vector_store to None
+
+try:
+    if os.path.exists(FAISS_INDEX_PATH):
+        print(f"Loading existing FAISS index from {FAISS_INDEX_PATH}")
+        vector_store = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
+    else:
+        print("Creating new FAISS index.")
+        # Initialize with a dummy entry if creating new
+        # This is where the JSONDecodeError was happening
+        vector_store = FAISS.from_texts(["Initial dummy entry"], embeddings)
+        vector_store.save_local(FAISS_INDEX_PATH)
+
+except JSONDecodeError as e:
+    # Specific handling for JSONDecodeError during FAISS initialization
+    error_message = (
+        "Failed to create or load FAISS index due to a JSONDecodeError. "
+        "This often means the Hugging Face Inference API did not return a valid JSON response, possibly due to:\n"
+        "1. Invalid or missing HUGGINGFACEHUB_API_TOKEN.\n"
+        "2. Network issues connecting to the Hugging Face API.\n"
+        "3. Temporary problems with the Hugging Face Inference API or the specific model.\n"
+        "4. Rate limits being exceeded.\n\n"
+        "Please check your API token, network connection, and the Hugging Face status page. "
+        f"Original error: {e}"
+    )
+    print(f"ERROR: {error_message}") # Log the detailed error
+    raise RuntimeError(error_message) from e
+
+except Exception as e:
+    # Catch any other potential errors during FAISS setup
+    raise RuntimeError(f"An unexpected error occurred during FAISS index setup: {e}") from e
+
+# Ensure vector_store was successfully initialized
+if vector_store is None:
+    raise RuntimeError("FAISS vector store could not be initialized. Check previous errors.")
 
 # --- Tool Definitions --- 
 
@@ -83,10 +120,14 @@ def save_story_preference(preference: str, config: RunnableConfig) -> str:
         page_content=preference,
         metadata={"user_id": user_id, "type": "preference", "doc_id": doc_id}
     )
-    vector_store.add_documents([document])
-    # Persist the updated index
-    vector_store.save_local(FAISS_INDEX_PATH)
-    return f"Preference saved: {preference}"
+    try:
+        vector_store.add_documents([document])
+        # Persist the updated index
+        vector_store.save_local(FAISS_INDEX_PATH)
+        return f"Preference saved: {preference}"
+    except Exception as e:
+        print(f"Error saving preference to vector store: {e}")
+        return f"Error saving preference: {e}"
 
 @tool
 def search_story_preferences(query: str, config: RunnableConfig) -> List[str]:
@@ -117,11 +158,14 @@ class AgentState(TypedDict):
 # Define the LLM using HuggingFaceHub
 # Requires HUGGINGFACEHUB_API_TOKEN
 # Using Meta's Llama 3 8B Instruct model via Inference API
-llm = HuggingFaceHub(
-    repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
-    huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
-    model_kwargs={"temperature": 0.7, "max_new_tokens": 512} # Adjust max_new_tokens as needed
-)
+try:
+    llm = HuggingFaceHub(
+        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
+        huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
+        model_kwargs={"temperature": 0.7, "max_new_tokens": 512} # Adjust max_new_tokens as needed
+    )
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize HuggingFaceHub LLM: {e}. Check API token and model repo_id.") from e
 
 # Define the prompt (remains largely the same, but ensure LLM understands tool use instructions)
 prompt = ChatPromptTemplate.from_messages(
@@ -163,10 +207,15 @@ agent_runnable = prompt | llm
 def agent_node(state: AgentState, config: RunnableConfig):
     """Invokes the LLM to generate a response or decide on tool use."""
     recall_str = "\n".join(state["recall_memories"])
-    response_text = agent_runnable.invoke(
-        {"messages": state["messages"], "recall_memories": recall_str},
-        config=config
-    )
+    try:
+        response_text = agent_runnable.invoke(
+            {"messages": state["messages"], "recall_memories": recall_str},
+            config=config
+        )
+    except Exception as e:
+        # Handle potential errors during LLM invocation
+        print(f"Error invoking LLM: {e}")
+        response_text = f"Sorry, I encountered an error trying to generate a response: {e}"
     
     # Basic check if the response indicates a tool call (based on prompt instructions)
     # This is a simplified approach. A more robust method would parse structured output or use ReAct logic.
@@ -193,16 +242,23 @@ def load_memories_node(state: AgentState, config: RunnableConfig):
             break
     
     if last_human_message:
-        relevant_memories = search_story_preferences.invoke(
-            {"query": last_human_message}, config=config
-        )
+        # Invoke the tool directly, handling potential list/string return types
+        try:
+            relevant_memories_result = search_story_preferences.invoke(
+                {"query": last_human_message}, config=config
+            )
+            if isinstance(relevant_memories_result, str):
+                 relevant_memories = [relevant_memories_result]
+            elif isinstance(relevant_memories_result, list):
+                 relevant_memories = relevant_memories_result
+            else:
+                 print(f"Warning: Unexpected type from search_story_preferences: {type(relevant_memories_result)}")
+                 relevant_memories = ["Error: Unexpected memory format."]
+        except Exception as e:
+            print(f"Error invoking search_story_preferences tool: {e}")
+            relevant_memories = [f"Error retrieving memories: {e}"]
     else:
         relevant_memories = ["No conversation history yet."]
-        
-    if isinstance(relevant_memories, str):
-        relevant_memories = [relevant_memories]
-    elif not isinstance(relevant_memories, list):
-        relevant_memories = ["Error retrieving memories."]
         
     return {"recall_memories": relevant_memories}
 
@@ -210,8 +266,11 @@ def load_memories_node(state: AgentState, config: RunnableConfig):
 def should_continue_node(state: AgentState):
     """Determines whether to route to tools or end the interaction."""
     messages = state["messages"]
+    if not messages:
+        return END # Should not happen with START node, but safety check
     last_message = messages[-1]
     # If the LLM attached tool calls, route to tools
+    # Check for the attribute *and* if it's non-empty
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
         return "tools"
     # Otherwise, end the conversation turn
@@ -254,11 +313,11 @@ story_agent_graph = builder.compile(checkpointer=memory)
 if __name__ == "__main__":
     print("Testing Storyteller Agent (Hugging Face API)...")
     
-    if not HUGGINGFACEHUB_API_TOKEN:
-        print("Error: HUGGINGFACEHUB_API_TOKEN not set. Cannot run test.")
-    else:
+    # The check for the token is now done earlier, 
+    # so this block will only run if the token exists and FAISS/LLM initialized.
+    try:
         # Example conversation flow
-        config_user_1 = {"configurable": {"user_id": "user_1_hf", "thread_id": "thread_hf_1"}}
+        config_user_1 = {"configurable": {"user_id": "user_1_hf_test", "thread_id": "thread_hf_test_1"}}
         
         # Initial interaction
         print("\n--- Turn 1 --- ")
@@ -286,4 +345,10 @@ if __name__ == "__main__":
         #     print("\nCurrent State:", current_state)
         # except Exception as e:
         #     print(f"Error getting state: {e}")
+            
+    except Exception as e:
+        print(f"\n--- Test Run Failed --- ")
+        print(f"An error occurred during the test run: {e}")
+        print("This might be due to configuration issues (like API token) or runtime errors.")
+
 
